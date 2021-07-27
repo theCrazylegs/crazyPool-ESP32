@@ -1,3 +1,0 @@
-(sym_lib_table
-  (lib (name esp32_devkit_v1_doit)(type Legacy)(uri ${KIPRJMOD}/kicad-master/symbols/esp32_devkit_v1_doit.lib)(options "")(descr ""))
-)
