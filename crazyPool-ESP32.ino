@@ -1,399 +1,307 @@
 /*
-CRAZYPOOL V1
-- ESP32 
+CRAZYPOOL V2
+- ESP32
 - Sonde PH DFRobot SKU:SEN0161-V2 en 3v3
-  ->  3 Bouton Poussoir pour le Calibrage de la sonde PH
-- Sonde Temp DFRobot SKU:DFR0198 (DS18B20) sur ESP32 5v et non 3v3
+  -> 3 Boutons Poussoir pour le Calibrage de la sonde PH
+- Sonde Temp DFRobot SKU:DFR0198 (DS18B20) sur ESP32 5v
 - Ecran LCD Pour Affichage de la Temperature et du PH
 - Energy PZEM-004t
+
+REFACTORING V2 — Stabilité WiFi/MQTT
+- WiFi + MQTT 100% non-bloquants (millis() state machine)
+- Boutons : détection de front montant (edge detection)
+- Watchdog timer : reboot automatique si le code se bloque
+- ID MQTT unique basé sur l'adresse MAC
+- snprintf() : construction JSON sans fragmentation mémoire
 */
 
 #include <DFRobot_ESP_PH.h>
 #include <EEPROM.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include <LiquidCrystal.h> // This library allows an Arduino board to control liquid crystal displays (LCDs) based on the Hitachi HD44780 (or a compatible) chipset
+#include <LiquidCrystal.h>
 #include <PZEM004Tv30.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
+#include <esp_task_wdt.h>
 #include "secrets.h"
 
-//PubSubClient::setBufferSize(512);
+
+// ─── Constantes ─────────────────────────────────────────────────────────────
+
+#define WDT_TIMEOUT_S      30    // Watchdog : reboot si loop() bloquée > 30s
+#define SENSOR_INTERVAL  10000U  // Lecture capteurs toutes les 10s
+#define MQTT_RETRY_INTERVAL 5000U // Tentative MQTT toutes les 5s si déconnecté
+
+// Broches
+#define pinBtEnter  4
+#define pinBtCal    2
+#define pinBtExit   15
+#define PH_PIN      33   // fil Bleu
+#define DS18B20_Pin 13   // fil Vert
+
+// Résolution ADC de l'ESP32
+#define ESPADC     4096.0
+#define ESPVOLTAGE 3300
 
 
-//DeepSleep
-//#define uS_TO_S_FACTOR 1000000  // Conversion factor for micro seconds to seconds
-//#define TIME_TO_SLEEP  60        /// Time ESP32 will go to sleep (in seconds)
-//RTC_DATA_ATTR int bootCount = 0; // compteur de réveil
+// ─── Objets ─────────────────────────────────────────────────────────────────
 
-
-
-
-long tps=0;
-String jsontomqtt;
-int boucle1 = 0;
-
-
-
-// Init PIN
-#define pinBtEnter 4
-#define pinBtCal 2
-#define pinBtExit 15
-#define PH_PIN 33 // fil Bleu
-#define DS18B20_Pin 13 //DS18B20 Signal Temperature // fil VERT
-
-
-
-// Init Value
-float phVoltage,phValue,temperature = 25;
-bool bDisplayPh = true;
-
-#define ESPADC 4096.0   //the esp Analog Digital Convertion value
-#define ESPVOLTAGE 3300 //the esp voltage supply value
-
-
-// Init Object
 DFRobot_ESP_PH ph;
-PZEM004Tv30 pzem(&Serial2);
-LiquidCrystal lcd(23,22,21,19,18,5); // quel num broche vont communiquer
-OneWire ds(DS18B20_Pin); // sonde Temp
-DallasTemperature sensors(&ds); // version ESP32 sonde Temp
+PZEM004Tv30    pzem(&Serial2);
+LiquidCrystal  lcd(23, 22, 21, 19, 18, 5);
+OneWire        ds(DS18B20_Pin);
+DallasTemperature sensors(&ds);
+WiFiClient     espClient;
+PubSubClient   mqttclient(espClient);
 
 
-// Init Wifi
-WiFiClient espClient;
-PubSubClient mqttclient(espClient);
+// ─── Variables d'état ───────────────────────────────────────────────────────
+
+float phVoltage, phValue, temperature = 25;
+
+// Timers non-bloquants
+unsigned long sensorTimer    = 0;
+unsigned long mqttRetryTimer = 0;
+bool          firstRun       = true;
+
+// Edge detection boutons (détection du front montant uniquement)
+bool lastBtEnter = false;
+bool lastBtCal   = false;
+bool lastBtExit  = false;
 
 
+// ─── Déclarations forward ───────────────────────────────────────────────────
+
+void readSensorsAndPublish();
+void tryMqttConnect();
+void handleButtons();
+float readTemperature();
+void onWifiConnected(WiFiEvent_t event, WiFiEventInfo_t info);
+void onWifiGotIP(WiFiEvent_t event, WiFiEventInfo_t info);
+void onWifiDisconnected(WiFiEvent_t event, WiFiEventInfo_t info);
+void mqttCallback(char* topic, byte* payload, unsigned int length);
 
 
+// ─── setup() ────────────────────────────────────────────────────────────────
 
 void setup() {
   Serial.begin(115200);
-  while(!Serial);
+  // PAS de while(!Serial) — bloque le démarrage standalone sans PC
 
+  // Watchdog : reboot automatique si la boucle principale se fige
+  esp_task_wdt_init(WDT_TIMEOUT_S, true);  // timeout, panic=true → reboot
+  esp_task_wdt_add(NULL);                  // surveille la tâche courante (loop)
+
+  // WiFi — event-driven, reconnexion automatique gérée par le stack
   WiFi.disconnect(true);
-  delay(1000);
-
-  WiFi.onEvent(Wifi_connected,SYSTEM_EVENT_STA_CONNECTED);
-  WiFi.onEvent(Get_IPAddress, SYSTEM_EVENT_STA_GOT_IP);
-  WiFi.onEvent(Wifi_disconnected, SYSTEM_EVENT_STA_DISCONNECTED); 
+  delay(100);
+  WiFi.onEvent(onWifiConnected,    SYSTEM_EVENT_STA_CONNECTED);
+  WiFi.onEvent(onWifiGotIP,        SYSTEM_EVENT_STA_GOT_IP);
+  WiFi.onEvent(onWifiDisconnected, SYSTEM_EVENT_STA_DISCONNECTED);
+  WiFi.setAutoReconnect(true);  // reconnexion auto sans intervention du code
   WiFi.begin(WIFI_SSID, WIFI_PWD);
-  Serial.println("Waiting for WIFI network...");
+  Serial.println("[WiFi] Connexion en cours...");
 
+  // MQTT — configuration uniquement (pas de connexion bloquante ici)
+  mqttclient.setServer(MQTT_BROKER, MQTT_BROKER_PORT);
+  mqttclient.setCallback(mqttCallback);
+  mqttclient.setBufferSize(512);
 
+  EEPROM.begin(32);  // Stockage calibration pH
 
-  //Increment boot number and print it every reboot
-  //++bootCount;
-  //Serial.println("Boot number: " + String(bootCount));
-
-  //Print the wakeup reason for ESP32
-  //print_wakeup_reason();
-
-  
-  //First we configure the wake up source
-  //We set our ESP32 to wake up every X seconds
-  
-  //esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
- // Serial.println("ESP32 réveillé dans " + String(TIME_TO_SLEEP) + " seconds");
-
-  
-  //setup_wifi();
-  //setup_mqtt();
-
-
-  EEPROM.begin(32);//needed to permit storage of calibration value in eeprom for Ph
-
-  
-  lcd.begin(16,2); //taille du LCD
+  // Ecran LCD
+  lcd.begin(16, 2);
   lcd.print("CRAZYPOOL");
-  lcd.setCursor(2,1);
-  lcd.print((char) 223);
-  lcd.setCursor(3,1);
-  lcd.print("C");  
-  lcd.setCursor(10,1);
+  lcd.setCursor(2, 1);
+  lcd.print((char)223);  // symbole °
+  lcd.setCursor(3, 1);
+  lcd.print("C");
+  lcd.setCursor(10, 1);
   lcd.print("PH:");
-  
 
-  ph.begin(); // Sonde Ph
-  sensors.begin(); // Sonde Temp 
+  ph.begin();       // Sonde pH
+  sensors.begin();  // Sonde température
 
   pinMode(pinBtEnter, INPUT);
   pinMode(pinBtCal,   INPUT);
   pinMode(pinBtExit,  INPUT);
 
-
-
+  Serial.println("[Setup] Prêt.");
 }
+
+
+// ─── loop() ─────────────────────────────────────────────────────────────────
 
 void loop() {
-  
-  // toutes les secondes
-  static unsigned long timepoint = millis();
-  if (millis() - timepoint > 10000U || boucle1 == 0) //time interval: 10s // on force un premier passage dès le début
-  {
-    timepoint = millis();
-    
-    boucle1 = 1;
+  esp_task_wdt_reset();  // Nourrit le watchdog — prouve que la boucle tourne
 
-    //sale :-( lors de problème de connexion WIFI l'affichage sur la première ligne part en vrille 
-    // [CRAZYPOOTU%#MQTT] au lieu de [CRAZYPOOL    MQTT]
-    lcd.setCursor(0,0);
-    lcd.print("CRAZYPOOL       ");
+  mqttclient.loop();     // Keepalive MQTT + réception messages — NON-BLOQUANT
 
-    Serial.println(mqttclient.connected());
+  handleButtons();       // Détection boutons sans aucun blocage
 
-    //Energy Analyse
-    float voltage = pzem.voltage(); //V
-    float current = pzem.current(); //A
-    float power = pzem.power(); //W
-    float energy = pzem.energy(); //kWh
-    float frequency = pzem.frequency(); //Hz
-    float pf = pzem.pf(); // power factor
-
-
-
-
-    
-    //if( !isnan(voltage) ){
-    //    Serial.print("Voltage: "); Serial.print(voltage); Serial.println("V");
-    //}
-
-    //if( !isnan(power) ){
-    //    Serial.print("Power: "); Serial.print(power); Serial.println("W");
-    //}
-    
-
-
-
-    // CALIBRATION par Bouton pourrsoir
-    if (digitalRead(pinBtEnter)){
-      ph.calibration(phVoltage,temperature,"ENTERPH"); 
-      lcd.setCursor(9,1);
-      lcd.print("CAL:");
-    }  
-    while (digitalRead(pinBtEnter));
-
-
-    // ON FIXE LA CALIBRATION PH4 / PH7
-    if (digitalRead(pinBtCal)){
-      ph.calibration(phVoltage,temperature,"CALPH"); 
-      lcd.setCursor(12,0);
-      lcd.print("save");
-    }
-    while (digitalRead(pinBtCal));
-
-
-    // ON SAUVE ET ON SORT DU MODE
-    if (digitalRead(pinBtExit)){
-      ph.calibration(phVoltage,temperature,"EXITPH"); 
-      lcd.setCursor(12,0);
-      lcd.print("    ");   
-      lcd.setCursor(9,1);
-      lcd.print(" PH:");     
-    }
-    while (digitalRead(pinBtExit));   
-
-
-
-    //   
-    //    // ATTENTION A FAIRE lors du calibrage QUID de la temperature des  solution de Ph 4 et 7 qui doivent être à 25°c
-    temperature = readTemperature();         // on lit la temperature de l'eau de la piscine
-
-    //voltage = rawPinValue / esp32ADC * esp32Vin
-    phVoltage = analogRead(PH_PIN) / ESPADC * ESPVOLTAGE; // read the voltage Arduino ESP32     
-    //     phVoltage = analogRead(PH_PIN)/1024.0*5000;  // read the voltage version Arduino UNO
-    phValue = ph.readPH(phVoltage,temperature);  // convert voltage to pH with temperature compensation
-
-
-
-    //Serial.print("temperature:");
-    //Serial.println(temperature,1);
-
-    // Serial.print("°C  pH:");
-    // Serial.println(phValue,1);
-
-    lcd.setCursor(0,1);
-    lcd.print(temperature,0);
-    lcd.setCursor(13,1);
-    lcd.print(phValue,1);
-    //ph.calibration(phVoltage, temperature); // calibration process by Serail CMD
-
-
-
-    if (WiFi.status() != WL_CONNECTED) {
-      
-      while ( WiFi.status() != WL_CONNECTED ) {
-        delay ( 500 );
-        Serial.print ( "." );
-      }
-
-      Serial.println("Connection failed.");
-      Serial.println("Waiting 5 seconds before retrying...");
-      delay(5000);
-      return;
-
-    }else{
-
-      if (!mqttclient.connected()) {
-        reconnect();
-      }
-     
-      // on met les données dans un JSON
-      jsontomqtt = "{\"temperature\": \"" + String(temperature) +"\", \"ph\": \"" + String(phValue) +"\", \"Volt\": \"" + String(voltage) +"\", \"Ampere\": \"" + String(current) +"\", \"Watts\": \"" + String(power) +"\", \"Kwh\": \"" + String(energy) +"\", \"Hz\": \"" + String(frequency) +"\", \"Power_factor\": \"" + String(pf) +"\"}";
-
-      Serial.println(jsontomqtt);
-
-      // on publie le JSON sur le broket
-      mqttclient.publish("esp32/crazypool", (char*) jsontomqtt.c_str(), true);
-
-      //Rentre en mode Deep Sleep
-      //Serial.println("Rentre en mode Light Sleep");
-      //Serial.println("----------------------");
-      //delay(100);
-      //esp_light_sleep_start();
-      
-
-
-    }
-
-
-    
-
-
+  // Reconnexion MQTT non-bloquante si WiFi ok mais MQTT déconnecté
+  if (WiFi.isConnected() && !mqttclient.connected()) {
+    tryMqttConnect();
   }
 
-  //Serial.println();
- // delay(100);
-}
-
-
-
-
-
-
-float readTemperature(){
-  
-  // avec Dallas
-  
-  sensors.requestTemperatures(); 
-  float temperatureC = sensors.getTempCByIndex(0);
-  return temperatureC;  
-
-}
-
-
-//void setup_wifi(){
-  //connexion au wifi
-//  wifiMulti.addAP(ssid, password);
-//  while ( wifiMulti.run() != WL_CONNECTED ) {
-//    delay ( 500 );
-//    Serial.print ( "." );
-//  }
-//  Serial.println("");
-//  Serial.println("WiFi connecté");
-//  Serial.print("MAC : ");
-//  Serial.println(WiFi.macAddress());
-//  Serial.print("Adresse IP : ");
-//  Serial.println(WiFi.localIP());
-//}
- 
-void setup_mqtt(){
-  mqttclient.setServer(MQTT_BROKER, MQTT_BROKER_PORT);
-  mqttclient.setCallback(callback);//Déclaration de la fonction de souscription
-  reconnect();
-}
-
- 
-//Callback doit être présent pour souscrire a un topic et de prévoir une action 
-void callback(char* topic, byte *payload, unsigned int length) {
-   Serial.println("-------Nouveau message du broker mqtt-----");
-   Serial.print("Canal:");
-   Serial.println(topic);
-   Serial.print("donnee:");
-   Serial.write(payload, length);
-   Serial.println();
-   if ((char)payload[0] == '1') {
-     Serial.println("LED ON");
-      digitalWrite(2,HIGH); 
-   } else {
-     Serial.println("LED OFF");
-     digitalWrite(2,LOW); 
-   }
- }
- 
- 
-void reconnect(){
-  while (!mqttclient.connected()) {
-    Serial.println("Connection au serveur MQTT ...");
-    if (mqttclient.connect("ESPClient", MQTT_USERNAME, MQTT_KEY)) {
-      Serial.println("MQTT connecté");
-      lcd.setCursor(12,0);
-      lcd.print("MQTT");
-    }
-    else {
-      Serial.print("echec, code erreur= ");
-      Serial.println(mqttclient.state());
-      Serial.println("nouvel essai dans 2s");
-      lcd.setCursor(12,0);
-      lcd.print("ERR2");
-    delay(2000);
-    }
+  // Lecture capteurs + publication toutes les SENSOR_INTERVAL millisecondes
+  if (firstRun || (millis() - sensorTimer >= SENSOR_INTERVAL)) {
+    sensorTimer = millis();
+    firstRun    = false;
+    readSensorsAndPublish();
   }
-  //mqttclient.subscribe("esp/test/led");//souscription au topic led pour commander une led
-}
- 
-//Fonction pour publier un float sur un topic 
-void mqtt_publish(String topic, float t){
-  char top[topic.length()+1];
-  topic.toCharArray(top,topic.length()+1);
-  char t_char[50];
-  String t_str = String(t);
-  t_str.toCharArray(t_char, t_str.length() + 1);
-  mqttclient.publish(top,t_char);
 }
 
 
+// ─── readSensorsAndPublish() ─────────────────────────────────────────────────
 
-//events Wifi
-void Wifi_connected(WiFiEvent_t event, WiFiEventInfo_t info){
-  Serial.println("Successfully connected to Access Point");
+void readSensorsAndPublish() {
+  // Lecture PZEM (peut renvoyer NaN si non alimenté — géré ci-dessous)
+  float voltage   = pzem.voltage();
+  float current   = pzem.current();
+  float power     = pzem.power();
+  float energy    = pzem.energy();
+  float frequency = pzem.frequency();
+  float pf        = pzem.pf();
+
+  // Lecture température + pH
+  temperature = readTemperature();
+  phVoltage   = analogRead(PH_PIN) / ESPADC * ESPVOLTAGE;
+  phValue     = ph.readPH(phVoltage, temperature);
+
+  // Mise à jour LCD
+  lcd.setCursor(0, 0);
+  lcd.print("CRAZYPOOL       ");
+  lcd.setCursor(0, 1);
+  lcd.print(temperature, 0);
+  lcd.setCursor(13, 1);
+  lcd.print(phValue, 1);
+
+  // Publication MQTT uniquement si les deux connexions sont actives
+  if (!WiFi.isConnected() || !mqttclient.connected()) {
+    Serial.printf("[Publish] Skipped — WiFi:%d MQTT:%d\n",
+                  WiFi.isConnected(), mqttclient.connected());
+    return;
+  }
+
+  // Construction JSON avec char buffer — pas de fragmentation mémoire
+  // Les valeurs NaN du PZEM sont remplacées par 0 plutôt qu'envoyées telles quelles
+  char jsonBuffer[256];
+  snprintf(jsonBuffer, sizeof(jsonBuffer),
+    "{\"temperature\":%.1f,\"ph\":%.2f,"
+    "\"Volt\":%.1f,\"Ampere\":%.3f,\"Watts\":%.1f,"
+    "\"Kwh\":%.3f,\"Hz\":%.1f,\"Power_factor\":%.2f}",
+    temperature,
+    phValue,
+    isnan(voltage)   ? 0.0f : voltage,
+    isnan(current)   ? 0.0f : current,
+    isnan(power)     ? 0.0f : power,
+    isnan(energy)    ? 0.0f : energy,
+    isnan(frequency) ? 0.0f : frequency,
+    isnan(pf)        ? 0.0f : pf
+  );
+
+  Serial.println(jsonBuffer);
+  mqttclient.publish("esp32/crazypool", jsonBuffer, true);
 }
 
-void Get_IPAddress(WiFiEvent_t event, WiFiEventInfo_t info){
-  Serial.println("WIFI is connected!");
-  Serial.println("IP address: ");
+
+// ─── tryMqttConnect() ────────────────────────────────────────────────────────
+// Tente une connexion MQTT UNE SEULE FOIS et rend la main immédiatement.
+// Rappelée depuis loop() toutes les MQTT_RETRY_INTERVAL ms si déconnecté.
+
+void tryMqttConnect() {
+  if (millis() - mqttRetryTimer < MQTT_RETRY_INTERVAL) return;
+  mqttRetryTimer = millis();
+
+  // ID unique basé sur l'adresse MAC — évite les conflits si plusieurs ESP32
+  String clientId = "CrazyPool-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+  Serial.printf("[MQTT] Connexion id=%s ...\n", clientId.c_str());
+
+  if (mqttclient.connect(clientId.c_str(), MQTT_USERNAME, MQTT_KEY)) {
+    Serial.println("[MQTT] Connecté !");
+    lcd.setCursor(12, 0);
+    lcd.print("MQTT");
+  } else {
+    Serial.printf("[MQTT] Echec code=%d, retry dans %lus\n",
+                  mqttclient.state(), MQTT_RETRY_INTERVAL / 1000);
+    lcd.setCursor(12, 0);
+    lcd.print("MERR");
+  }
+  // On retourne immédiatement — AUCUN délai, AUCUNE boucle
+}
+
+
+// ─── handleButtons() ─────────────────────────────────────────────────────────
+// Edge detection : réagit uniquement quand le bouton PASSE de relâché à pressé.
+// Aucun while(), aucun delay() — la boucle principale continue de tourner.
+
+void handleButtons() {
+  bool curEnter = digitalRead(pinBtEnter);
+  bool curCal   = digitalRead(pinBtCal);
+  bool curExit  = digitalRead(pinBtExit);
+
+  if (curEnter && !lastBtEnter) {  // Front montant ENTER
+    ph.calibration(phVoltage, temperature, "ENTERPH");
+    lcd.setCursor(9, 1);
+    lcd.print("CAL:");
+  }
+
+  if (curCal && !lastBtCal) {      // Front montant CAL
+    ph.calibration(phVoltage, temperature, "CALPH");
+    lcd.setCursor(12, 0);
+    lcd.print("save");
+  }
+
+  if (curExit && !lastBtExit) {    // Front montant EXIT
+    ph.calibration(phVoltage, temperature, "EXITPH");
+    lcd.setCursor(12, 0);
+    lcd.print("    ");
+    lcd.setCursor(9, 1);
+    lcd.print(" PH:");
+  }
+
+  // Mémoriser l'état pour la prochaine itération
+  lastBtEnter = curEnter;
+  lastBtCal   = curCal;
+  lastBtExit  = curExit;
+}
+
+
+// ─── readTemperature() ───────────────────────────────────────────────────────
+
+float readTemperature() {
+  sensors.requestTemperatures();
+  return sensors.getTempCByIndex(0);
+}
+
+
+// ─── Events WiFi ─────────────────────────────────────────────────────────────
+
+void onWifiConnected(WiFiEvent_t event, WiFiEventInfo_t info) {
+  Serial.println("[WiFi] Associé au point d'accès");
+}
+
+void onWifiGotIP(WiFiEvent_t event, WiFiEventInfo_t info) {
+  Serial.print("[WiFi] IP : ");
   Serial.println(WiFi.localIP());
-
-  lcd.setCursor(12,0);
+  lcd.setCursor(12, 0);
   lcd.print("WIFI");
-
-  setup_mqtt(); // on se connecte au serveur MQTT
+  mqttRetryTimer = 0;  // Déclencher une tentative MQTT immédiate
 }
 
-void Wifi_disconnected(WiFiEvent_t event, WiFiEventInfo_t info){
-
-  lcd.setCursor(12,0);
-  lcd.print("ERR1");
-
-  Serial.println("Disconnected from WIFI access point");
-  Serial.print("WiFi lost connection. Reason: ");
-  Serial.println(info.disconnected.reason);
-  Serial.println("Reconnecting...");
-  WiFi.begin(WIFI_SSID, WIFI_PWD);
+void onWifiDisconnected(WiFiEvent_t event, WiFiEventInfo_t info) {
+  Serial.printf("[WiFi] Déconnecté, raison : %d\n", info.disconnected.reason);
+  lcd.setCursor(12, 0);
+  lcd.print("NWIF");
+  // WiFi.setAutoReconnect(true) gère la reconnexion — rien à faire ici
 }
 
 
-void print_wakeup_reason(){
-   esp_sleep_wakeup_cause_t source_reveil;
+// ─── Callback MQTT ───────────────────────────────────────────────────────────
 
-   source_reveil = esp_sleep_get_wakeup_cause();
-
-   switch(source_reveil){
-      case ESP_SLEEP_WAKEUP_EXT0 : Serial.println("Réveil causé par un signal externe avec RTC_IO"); break;
-      case ESP_SLEEP_WAKEUP_EXT1 : Serial.println("Réveil causé par un signal externe avec RTC_CNTL"); break;
-      case ESP_SLEEP_WAKEUP_TIMER : Serial.println("Réveil causé par un timer"); break;
-      case ESP_SLEEP_WAKEUP_TOUCHPAD : Serial.println("Réveil causé par un touchpad"); break;
-      default : Serial.printf("Réveil pas causé par le Deep Sleep: %d\n",source_reveil); break;
-   }
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  Serial.printf("[MQTT] Message reçu — topic : %s\n", topic);
+  // Traitement des commandes entrantes à implémenter ici si besoin
 }
