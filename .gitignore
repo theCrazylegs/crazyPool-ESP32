@@ -1,0 +1,10 @@
+# Fichier de secrets - NE JAMAIS COMMITTER
+secrets.h
+
+# Fichiers Arduino / IDE
+*.bak
+*.orig
+
+# Fichiers système Windows
+Thumbs.db
+desktop.ini
