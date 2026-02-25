@@ -7,12 +7,16 @@ CRAZYPOOL V2
 - Ecran LCD Pour Affichage de la Temperature et du PH
 - Energy PZEM-004t
 
-REFACTORING V2 — Stabilité WiFi/MQTT
+REFACTORING V2 — Stabilité + Robustesse + Maintenance
 - WiFi + MQTT 100% non-bloquants (millis() state machine)
 - Boutons : détection de front montant (edge detection)
 - Watchdog timer : reboot automatique si le code se bloque
 - ID MQTT unique basé sur l'adresse MAC
-- snprintf() : construction JSON sans fragmentation mémoire
+- ArduinoJson : construction JSON sans fragmentation mémoire
+- MQTT LWT : broker publie "offline" si déconnexion brutale
+- Valeurs NaN PZEM remplacées par 0 dans le JSON
+- OTA : mise à jour firmware via WiFi (sans câble USB)
+- Log levels : macros LOG_INFO/WARN/ERROR (niveau via LOG_LEVEL)
 */
 
 #include <DFRobot_ESP_PH.h>
@@ -23,6 +27,8 @@ REFACTORING V2 — Stabilité WiFi/MQTT
 #include <PZEM004Tv30.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <ArduinoOTA.h>
 #include <esp_task_wdt.h>
 #include "secrets.h"
 
@@ -43,6 +49,33 @@ REFACTORING V2 — Stabilité WiFi/MQTT
 // Résolution ADC de l'ESP32
 #define ESPADC     4096.0
 #define ESPVOLTAGE 3300
+
+// Topics MQTT
+#define MQTT_TOPIC_DATA   "esp32/crazypool"
+#define MQTT_TOPIC_STATUS "esp32/crazypool/status"
+
+// Log levels : 0=off  1=error  2=info (défaut)  3=debug
+// Peut être surchargé depuis platformio.ini : build_flags = -DLOG_LEVEL=3
+#ifndef LOG_LEVEL
+#define LOG_LEVEL 2
+#endif
+#if LOG_LEVEL >= 3
+  #define LOG_DEBUG(fmt, ...) Serial.printf("[DEBUG] " fmt "\n", ##__VA_ARGS__)
+#else
+  #define LOG_DEBUG(fmt, ...)
+#endif
+#if LOG_LEVEL >= 2
+  #define LOG_INFO(fmt, ...)  Serial.printf("[INFO]  " fmt "\n", ##__VA_ARGS__)
+#else
+  #define LOG_INFO(fmt, ...)
+#endif
+#if LOG_LEVEL >= 1
+  #define LOG_WARN(fmt, ...)  Serial.printf("[WARN]  " fmt "\n", ##__VA_ARGS__)
+  #define LOG_ERROR(fmt, ...) Serial.printf("[ERROR] " fmt "\n", ##__VA_ARGS__)
+#else
+  #define LOG_WARN(fmt, ...)
+  #define LOG_ERROR(fmt, ...)
+#endif
 
 
 // ─── Objets ─────────────────────────────────────────────────────────────────
@@ -108,6 +141,31 @@ void setup() {
   mqttclient.setCallback(mqttCallback);
   mqttclient.setBufferSize(512);
 
+  // OTA — mise à jour firmware via WiFi, sans câble USB
+  // OTA_PASSWORD doit être défini dans secrets.h — sinon mot de passe par défaut utilisé
+  #ifndef OTA_PASSWORD
+    #warning "OTA_PASSWORD non défini dans secrets.h ! Définissez-le pour sécuriser les mises à jour."
+    #define OTA_PASSWORD "crazypool-ota"
+  #endif
+  ArduinoOTA.setHostname("CrazyPool");
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.onStart([]() {
+    LOG_INFO("OTA: demarrage mise a jour...");
+    esp_task_wdt_reset();  // evite un reboot watchdog pendant le flash
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    esp_task_wdt_reset();  // nourrit le watchdog pendant le telechargement
+    LOG_DEBUG("OTA: %u%%", progress / (total / 100));
+  });
+  ArduinoOTA.onEnd([]() {
+    LOG_INFO("OTA: termine, redemarrage...");
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    LOG_ERROR("OTA: erreur code %u", error);
+  });
+  ArduinoOTA.begin();
+  LOG_INFO("OTA: en attente sur 'CrazyPool.local'");
+
   EEPROM.begin(32);  // Stockage calibration pH
 
   // Ecran LCD
@@ -135,6 +193,8 @@ void setup() {
 
 void loop() {
   esp_task_wdt_reset();  // Nourrit le watchdog — prouve que la boucle tourne
+
+  ArduinoOTA.handle();   // Ecoute les demandes de flash OTA — NON-BLOQUANT
 
   mqttclient.loop();     // Keepalive MQTT + réception messages — NON-BLOQUANT
 
@@ -185,25 +245,23 @@ void readSensorsAndPublish() {
     return;
   }
 
-  // Construction JSON avec char buffer — pas de fragmentation mémoire
+  // Construction JSON avec ArduinoJson — allocation propre, pas de fragmentation
   // Les valeurs NaN du PZEM sont remplacées par 0 plutôt qu'envoyées telles quelles
+  JsonDocument doc;
+  doc["temperature"]  = temperature;
+  doc["ph"]           = phValue;
+  doc["Volt"]         = isnan(voltage)   ? 0.0f : voltage;
+  doc["Ampere"]       = isnan(current)   ? 0.0f : current;
+  doc["Watts"]        = isnan(power)     ? 0.0f : power;
+  doc["Kwh"]          = isnan(energy)    ? 0.0f : energy;
+  doc["Hz"]           = isnan(frequency) ? 0.0f : frequency;
+  doc["Power_factor"] = isnan(pf)        ? 0.0f : pf;
+
   char jsonBuffer[256];
-  snprintf(jsonBuffer, sizeof(jsonBuffer),
-    "{\"temperature\":%.1f,\"ph\":%.2f,"
-    "\"Volt\":%.1f,\"Ampere\":%.3f,\"Watts\":%.1f,"
-    "\"Kwh\":%.3f,\"Hz\":%.1f,\"Power_factor\":%.2f}",
-    temperature,
-    phValue,
-    isnan(voltage)   ? 0.0f : voltage,
-    isnan(current)   ? 0.0f : current,
-    isnan(power)     ? 0.0f : power,
-    isnan(energy)    ? 0.0f : energy,
-    isnan(frequency) ? 0.0f : frequency,
-    isnan(pf)        ? 0.0f : pf
-  );
+  serializeJson(doc, jsonBuffer, sizeof(jsonBuffer));
 
   Serial.println(jsonBuffer);
-  mqttclient.publish("esp32/crazypool", jsonBuffer, true);
+  mqttclient.publish(MQTT_TOPIC_DATA, jsonBuffer, true);
 }
 
 
@@ -219,10 +277,14 @@ void tryMqttConnect() {
   String clientId = "CrazyPool-" + String((uint32_t)ESP.getEfuseMac(), HEX);
   Serial.printf("[MQTT] Connexion id=%s ...\n", clientId.c_str());
 
-  if (mqttclient.connect(clientId.c_str(), MQTT_USERNAME, MQTT_KEY)) {
-    Serial.println("[MQTT] Connecté !");
+  // LWT : si l'ESP32 perd le courant ou plante, le broker publie "offline" tout seul
+  if (mqttclient.connect(clientId.c_str(), MQTT_USERNAME, MQTT_KEY,
+                         MQTT_TOPIC_STATUS, 1, true, "offline")) {
+    Serial.println("[MQTT] Connecte !");
     lcd.setCursor(12, 0);
     lcd.print("MQTT");
+    // Annoncer qu'on est en ligne (retained → Home Assistant le voit même après reconnexion)
+    mqttclient.publish(MQTT_TOPIC_STATUS, "online", true);
   } else {
     Serial.printf("[MQTT] Echec code=%d, retry dans %lus\n",
                   mqttclient.state(), MQTT_RETRY_INTERVAL / 1000);
