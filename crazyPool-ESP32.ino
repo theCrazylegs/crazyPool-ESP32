@@ -7,7 +7,7 @@ CRAZYPOOL V2
 - Ecran LCD Pour Affichage de la Temperature et du PH
 - Energy PZEM-004t
 
-REFACTORING V2 — Stabilité + Robustesse
+REFACTORING V2 — Stabilité + Robustesse + Maintenance
 - WiFi + MQTT 100% non-bloquants (millis() state machine)
 - Boutons : détection de front montant (edge detection)
 - Watchdog timer : reboot automatique si le code se bloque
@@ -15,6 +15,8 @@ REFACTORING V2 — Stabilité + Robustesse
 - ArduinoJson : construction JSON sans fragmentation mémoire
 - MQTT LWT : broker publie "offline" si déconnexion brutale
 - Valeurs NaN PZEM remplacées par 0 dans le JSON
+- OTA : mise à jour firmware via WiFi (sans câble USB)
+- Log levels : macros LOG_INFO/WARN/ERROR (niveau via LOG_LEVEL)
 */
 
 #include <DFRobot_ESP_PH.h>
@@ -26,6 +28,7 @@ REFACTORING V2 — Stabilité + Robustesse
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <ArduinoOTA.h>
 #include <esp_task_wdt.h>
 #include "secrets.h"
 
@@ -50,6 +53,29 @@ REFACTORING V2 — Stabilité + Robustesse
 // Topics MQTT
 #define MQTT_TOPIC_DATA   "esp32/crazypool"
 #define MQTT_TOPIC_STATUS "esp32/crazypool/status"
+
+// Log levels : 0=off  1=error  2=info (défaut)  3=debug
+// Peut être surchargé depuis platformio.ini : build_flags = -DLOG_LEVEL=3
+#ifndef LOG_LEVEL
+#define LOG_LEVEL 2
+#endif
+#if LOG_LEVEL >= 3
+  #define LOG_DEBUG(fmt, ...) Serial.printf("[DEBUG] " fmt "\n", ##__VA_ARGS__)
+#else
+  #define LOG_DEBUG(fmt, ...)
+#endif
+#if LOG_LEVEL >= 2
+  #define LOG_INFO(fmt, ...)  Serial.printf("[INFO]  " fmt "\n", ##__VA_ARGS__)
+#else
+  #define LOG_INFO(fmt, ...)
+#endif
+#if LOG_LEVEL >= 1
+  #define LOG_WARN(fmt, ...)  Serial.printf("[WARN]  " fmt "\n", ##__VA_ARGS__)
+  #define LOG_ERROR(fmt, ...) Serial.printf("[ERROR] " fmt "\n", ##__VA_ARGS__)
+#else
+  #define LOG_WARN(fmt, ...)
+  #define LOG_ERROR(fmt, ...)
+#endif
 
 
 // ─── Objets ─────────────────────────────────────────────────────────────────
@@ -115,6 +141,31 @@ void setup() {
   mqttclient.setCallback(mqttCallback);
   mqttclient.setBufferSize(512);
 
+  // OTA — mise à jour firmware via WiFi, sans câble USB
+  // OTA_PASSWORD doit être défini dans secrets.h — sinon mot de passe par défaut utilisé
+  #ifndef OTA_PASSWORD
+    #warning "OTA_PASSWORD non défini dans secrets.h ! Définissez-le pour sécuriser les mises à jour."
+    #define OTA_PASSWORD "crazypool-ota"
+  #endif
+  ArduinoOTA.setHostname("CrazyPool");
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.onStart([]() {
+    LOG_INFO("OTA: demarrage mise a jour...");
+    esp_task_wdt_reset();  // evite un reboot watchdog pendant le flash
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    esp_task_wdt_reset();  // nourrit le watchdog pendant le telechargement
+    LOG_DEBUG("OTA: %u%%", progress / (total / 100));
+  });
+  ArduinoOTA.onEnd([]() {
+    LOG_INFO("OTA: termine, redemarrage...");
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    LOG_ERROR("OTA: erreur code %u", error);
+  });
+  ArduinoOTA.begin();
+  LOG_INFO("OTA: en attente sur 'CrazyPool.local'");
+
   EEPROM.begin(32);  // Stockage calibration pH
 
   // Ecran LCD
@@ -142,6 +193,8 @@ void setup() {
 
 void loop() {
   esp_task_wdt_reset();  // Nourrit le watchdog — prouve que la boucle tourne
+
+  ArduinoOTA.handle();   // Ecoute les demandes de flash OTA — NON-BLOQUANT
 
   mqttclient.loop();     // Keepalive MQTT + réception messages — NON-BLOQUANT
 
