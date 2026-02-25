@@ -5,6 +5,10 @@ secrets.h
 *.bak
 *.orig
 
+# PlatformIO
+.pio/
+.vscode/
+
 # Fichiers système Windows
 Thumbs.db
 desktop.ini
