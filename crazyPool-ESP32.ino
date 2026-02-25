@@ -48,7 +48,7 @@ REFACTORING V2 — Stabilité WiFi/MQTT
 // ─── Objets ─────────────────────────────────────────────────────────────────
 
 DFRobot_ESP_PH ph;
-PZEM004Tv30    pzem(&Serial2);
+PZEM004Tv30    pzem(Serial2, 16, 17);  // Serial2, RX2=GPIO16, TX2=GPIO17
 LiquidCrystal  lcd(23, 22, 21, 19, 18, 5);
 OneWire        ds(DS18B20_Pin);
 DallasTemperature sensors(&ds);
@@ -96,9 +96,9 @@ void setup() {
   // WiFi — event-driven, reconnexion automatique gérée par le stack
   WiFi.disconnect(true);
   delay(100);
-  WiFi.onEvent(onWifiConnected,    SYSTEM_EVENT_STA_CONNECTED);
-  WiFi.onEvent(onWifiGotIP,        SYSTEM_EVENT_STA_GOT_IP);
-  WiFi.onEvent(onWifiDisconnected, SYSTEM_EVENT_STA_DISCONNECTED);
+  WiFi.onEvent(onWifiConnected,    ARDUINO_EVENT_WIFI_STA_CONNECTED);
+  WiFi.onEvent(onWifiGotIP,        ARDUINO_EVENT_WIFI_STA_GOT_IP);
+  WiFi.onEvent(onWifiDisconnected, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   WiFi.setAutoReconnect(true);  // reconnexion auto sans intervention du code
   WiFi.begin(WIFI_SSID, WIFI_PWD);
   Serial.println("[WiFi] Connexion en cours...");
@@ -243,19 +243,19 @@ void handleButtons() {
   bool curExit  = digitalRead(pinBtExit);
 
   if (curEnter && !lastBtEnter) {  // Front montant ENTER
-    ph.calibration(phVoltage, temperature, "ENTERPH");
+    ph.calibration(phVoltage, temperature, (char*)"ENTERPH");
     lcd.setCursor(9, 1);
     lcd.print("CAL:");
   }
 
   if (curCal && !lastBtCal) {      // Front montant CAL
-    ph.calibration(phVoltage, temperature, "CALPH");
+    ph.calibration(phVoltage, temperature, (char*)"CALPH");
     lcd.setCursor(12, 0);
     lcd.print("save");
   }
 
   if (curExit && !lastBtExit) {    // Front montant EXIT
-    ph.calibration(phVoltage, temperature, "EXITPH");
+    ph.calibration(phVoltage, temperature, (char*)"EXITPH");
     lcd.setCursor(12, 0);
     lcd.print("    ");
     lcd.setCursor(9, 1);
@@ -279,11 +279,11 @@ float readTemperature() {
 
 // ─── Events WiFi ─────────────────────────────────────────────────────────────
 
-void onWifiConnected(WiFiEvent_t event, WiFiEventInfo_t info) {
+void onWifiConnected(arduino_event_id_t event, arduino_event_info_t info) {
   Serial.println("[WiFi] Associé au point d'accès");
 }
 
-void onWifiGotIP(WiFiEvent_t event, WiFiEventInfo_t info) {
+void onWifiGotIP(arduino_event_id_t event, arduino_event_info_t info) {
   Serial.print("[WiFi] IP : ");
   Serial.println(WiFi.localIP());
   lcd.setCursor(12, 0);
@@ -291,11 +291,11 @@ void onWifiGotIP(WiFiEvent_t event, WiFiEventInfo_t info) {
   mqttRetryTimer = 0;  // Déclencher une tentative MQTT immédiate
 }
 
-void onWifiDisconnected(WiFiEvent_t event, WiFiEventInfo_t info) {
-  Serial.printf("[WiFi] Déconnecté, raison : %d\n", info.disconnected.reason);
+void onWifiDisconnected(arduino_event_id_t event, arduino_event_info_t info) {
+  Serial.printf("[WiFi] Deconnecte, raison : %d\n", info.wifi_sta_disconnected.reason);
   lcd.setCursor(12, 0);
   lcd.print("NWIF");
-  // WiFi.setAutoReconnect(true) gère la reconnexion — rien à faire ici
+  // WiFi.setAutoReconnect(true) gere la reconnexion — rien a faire ici
 }
 
 
