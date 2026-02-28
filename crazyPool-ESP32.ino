@@ -38,6 +38,7 @@ REFACTORING V2 — Stabilité + Robustesse + Maintenance
 #define WDT_TIMEOUT_S      30    // Watchdog : reboot si loop() bloquée > 30s
 #define SENSOR_INTERVAL  10000U  // Lecture capteurs toutes les 10s
 #define MQTT_RETRY_INTERVAL 5000U // Tentative MQTT toutes les 5s si déconnecté
+#define DEBOUNCE_MS         20U  // Anti-rebond boutons (20ms)
 
 // Broches
 #define pinBtEnter  4
@@ -94,14 +95,19 @@ PubSubClient   mqttclient(espClient);
 float phVoltage, phValue, temperature = 25;
 
 // Timers non-bloquants
-unsigned long sensorTimer    = 0;
-unsigned long mqttRetryTimer = 0;
-bool          firstRun       = true;
+unsigned long sensorTimer         = 0;
+unsigned long mqttRetryTimer      = 0;
+unsigned long tempRequestTimer    = 0;
+bool          firstRun            = true;
+bool          tempConversionPending = false;
 
 // Edge detection boutons (détection du front montant uniquement)
-bool lastBtEnter = false;
-bool lastBtCal   = false;
-bool lastBtExit  = false;
+bool          lastBtEnter    = false;
+bool          lastBtCal      = false;
+bool          lastBtExit     = false;
+unsigned long debounceEnter  = 0;
+unsigned long debounceCal    = 0;
+unsigned long debounceExit   = 0;
 
 
 // ─── Déclarations forward ───────────────────────────────────────────────────
@@ -168,7 +174,8 @@ void setup() {
 
   EEPROM.begin(32);  // Stockage calibration pH
 
-  // Ecran LCD
+  // Ecran LCD — délai nécessaire après soft-reset OTA (le LCD a besoin de temps pour démarrer)
+  delay(300);
   lcd.begin(16, 2);
   lcd.print("CRAZYPOOL");
   lcd.setCursor(2, 1);
@@ -180,6 +187,7 @@ void setup() {
 
   ph.begin();       // Sonde pH
   sensors.begin();  // Sonde température
+  sensors.setWaitForConversion(false);  // conversion non-bloquante (~750ms en tâche de fond)
 
   pinMode(pinBtEnter, INPUT);
   pinMode(pinBtCal,   INPUT);
@@ -205,10 +213,20 @@ void loop() {
     tryMqttConnect();
   }
 
-  // Lecture capteurs + publication toutes les SENSOR_INTERVAL millisecondes
-  if (firstRun || (millis() - sensorTimer >= SENSOR_INTERVAL)) {
-    sensorTimer = millis();
-    firstRun    = false;
+  unsigned long now = millis();
+
+  // Phase 1 — lancer la conversion température (retourne immédiatement, pas de blocage)
+  if (firstRun || (now - sensorTimer >= SENSOR_INTERVAL)) {
+    sensorTimer           = now;
+    firstRun              = false;
+    sensors.requestTemperatures();
+    tempRequestTimer      = now;
+    tempConversionPending = true;
+  }
+
+  // Phase 2 — lire température + pH + publier une fois la conversion terminée (~800ms)
+  if (tempConversionPending && (now - tempRequestTimer >= 800)) {
+    tempConversionPending = false;
     readSensorsAndPublish();
   }
 }
@@ -274,11 +292,12 @@ void tryMqttConnect() {
   mqttRetryTimer = millis();
 
   // ID unique basé sur l'adresse MAC — évite les conflits si plusieurs ESP32
-  String clientId = "CrazyPool-" + String((uint32_t)ESP.getEfuseMac(), HEX);
-  Serial.printf("[MQTT] Connexion id=%s ...\n", clientId.c_str());
+  char clientId[32];
+  snprintf(clientId, sizeof(clientId), "CrazyPool-%08x", (uint32_t)ESP.getEfuseMac());
+  Serial.printf("[MQTT] Connexion id=%s ...\n", clientId);
 
   // LWT : si l'ESP32 perd le courant ou plante, le broker publie "offline" tout seul
-  if (mqttclient.connect(clientId.c_str(), MQTT_USERNAME, MQTT_KEY,
+  if (mqttclient.connect(clientId, MQTT_USERNAME, MQTT_KEY,
                          MQTT_TOPIC_STATUS, 1, true, "offline")) {
     Serial.println("[MQTT] Connecte !");
     lcd.setCursor(12, 0);
@@ -304,19 +323,24 @@ void handleButtons() {
   bool curCal   = digitalRead(pinBtCal);
   bool curExit  = digitalRead(pinBtExit);
 
-  if (curEnter && !lastBtEnter) {  // Front montant ENTER
+  unsigned long now = millis();
+
+  if (curEnter && !lastBtEnter && (now - debounceEnter >= DEBOUNCE_MS)) {
+    debounceEnter = now;
     ph.calibration(phVoltage, temperature, (char*)"ENTERPH");
     lcd.setCursor(9, 1);
     lcd.print("CAL:");
   }
 
-  if (curCal && !lastBtCal) {      // Front montant CAL
+  if (curCal && !lastBtCal && (now - debounceCal >= DEBOUNCE_MS)) {
+    debounceCal = now;
     ph.calibration(phVoltage, temperature, (char*)"CALPH");
     lcd.setCursor(12, 0);
     lcd.print("save");
   }
 
-  if (curExit && !lastBtExit) {    // Front montant EXIT
+  if (curExit && !lastBtExit && (now - debounceExit >= DEBOUNCE_MS)) {
+    debounceExit = now;
     ph.calibration(phVoltage, temperature, (char*)"EXITPH");
     lcd.setCursor(12, 0);
     lcd.print("    ");
@@ -334,8 +358,7 @@ void handleButtons() {
 // ─── readTemperature() ───────────────────────────────────────────────────────
 
 float readTemperature() {
-  sensors.requestTemperatures();
-  return sensors.getTempCByIndex(0);
+  return sensors.getTempCByIndex(0);  // requestTemperatures() déjà appelé dans loop()
 }
 
 
