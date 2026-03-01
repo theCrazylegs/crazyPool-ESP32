@@ -1,23 +1,43 @@
 /*
-CRAZYPOOL V2
-- ESP32
-- Sonde PH DFRobot SKU:SEN0161-V2 en 3v3
-  -> 3 Boutons Poussoir pour le Calibrage de la sonde PH
-- Sonde Temp DFRobot SKU:DFR0198 (DS18B20) sur ESP32 5v
-- Ecran LCD Pour Affichage de la Temperature et du PH
-- Energy PZEM-004t
-
-REFACTORING V2 — Stabilité + Robustesse + Maintenance
-- WiFi + MQTT 100% non-bloquants (millis() state machine)
-- Boutons : détection de front montant (edge detection)
-- Watchdog timer : reboot automatique si le code se bloque
-- ID MQTT unique basé sur l'adresse MAC
-- ArduinoJson : construction JSON sans fragmentation mémoire
-- MQTT LWT : broker publie "offline" si déconnexion brutale
-- Valeurs NaN PZEM remplacées par 0 dans le JSON
-- OTA : mise à jour firmware via WiFi (sans câble USB)
-- Log levels : macros LOG_INFO/WARN/ERROR (niveau via LOG_LEVEL)
-*/
+ * ═══════════════════════════════════════════════════════════════════════════
+ *  CRAZYPOOL V2 — Gestion piscine ESP32
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ *  Capteurs :
+ *    - Sonde pH     DFRobot SEN0161-V2 (3.3V)
+ *    - Sonde Temp   DFRobot DFR0198 / DS18B20 (5V)
+ *    - Énergie      PZEM-004t v3
+ *
+ *  Affichage :
+ *    - LCD 16×2 HD44780
+ *
+ *  Connectivité :
+ *    - WiFi + MQTT (non-bloquants)
+ *    - OTA (mise à jour sans câble)
+ *
+ *  Calibration pH — 1 bouton unique (GPIO 2, pull-down externe) :
+ *    - Appui long  3s en IDLE → entre en mode calibration
+ *    - Appui court    en CAL  → sauvegarde un point (pH4 ou pH7)
+ *    - Appui long  3s en CAL  → quitte et sauvegarde en EEPROM
+ *    - Timeout 60s en CAL     → auto-exit + sauvegarde
+ *    - Appui court en IDLE    → ignoré (anti-accidentel)
+ *
+ *  Améliorations V2 vs V1 :
+ *    - WiFi + MQTT 100% non-bloquants (millis)
+ *    - Watchdog timer (reboot auto si freeze)
+ *    - ArduinoJson (JSON propre, pas de fragmentation)
+ *    - MQTT LWT ("offline" publié par le broker si crash)
+ *    - ID MQTT unique (MAC)
+ *    - Température non-bloquante (requestTemperatures async)
+ *    - LCD : séparation stricte des zones d'écriture (pas de conflit)
+ *    - Log levels (LOG_INFO / LOG_WARN / LOG_ERROR / LOG_DEBUG)
+ *
+ *  Dépendances (platformio.ini ou Arduino IDE) :
+ *    DFRobot_ESP_PH, OneWire, DallasTemperature, LiquidCrystal,
+ *    PZEM004Tv30, PubSubClient, ArduinoJson, ArduinoOTA
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 #include <DFRobot_ESP_PH.h>
 #include <EEPROM.h>
@@ -33,33 +53,37 @@ REFACTORING V2 — Stabilité + Robustesse + Maintenance
 #include "secrets.h"
 
 
-// ─── Constantes ─────────────────────────────────────────────────────────────
+// ─── Configuration ──────────────────────────────────────────────────────────
 
-#define WDT_TIMEOUT_S      30    // Watchdog : reboot si loop() bloquée > 30s
-#define SENSOR_INTERVAL  10000U  // Lecture capteurs toutes les 10s
-#define MQTT_RETRY_INTERVAL 5000U // Tentative MQTT toutes les 5s si déconnecté
-#define DEBOUNCE_MS         20U  // Anti-rebond boutons (20ms)
+// Timings
+#define WDT_TIMEOUT_S        30      // Watchdog : reboot si loop() bloquée > 30s
+#define SENSOR_INTERVAL      10000U  // Lecture capteurs toutes les 10s
+#define MQTT_RETRY_INTERVAL  5000U   // Tentative MQTT toutes les 5s
+#define DEBOUNCE_MS          50U     // Anti-rebond bouton (50ms — plus fiable que 20ms)
+#define LONGPRESS_MS         3000U   // Durée appui long pour calibration
+#define CAL_TIMEOUT_MS       60000U  // Auto-exit calibration si inactif 60s
 
 // Broches
-#define pinBtEnter  4
-#define pinBtCal    2
-#define pinBtExit   15
-#define PH_PIN      33   // fil Bleu
-#define DS18B20_Pin 13   // fil Vert
+#define PIN_BUTTON    2    // Bouton unique calibration pH (pull-down externe, HIGH=pressé)
+#define PH_PIN       33    // Sonde pH — fil bleu
+#define DS18B20_PIN  13    // Sonde température — fil vert
+// LCD : RS=23, EN=22, D4=21, D5=19, D6=18, D7=5
+// PZEM : Serial2 RX=GPIO16, TX=GPIO17
 
-// Résolution ADC de l'ESP32
-#define ESPADC     4096.0
-#define ESPVOLTAGE 3300
+// ADC ESP32
+#define ESPADC      4096.0
+#define ESPVOLTAGE  3300
 
-// Topics MQTT
-#define MQTT_TOPIC_DATA   "esp32/crazypool"
-#define MQTT_TOPIC_STATUS "esp32/crazypool/status"
+// MQTT Topics
+#define MQTT_TOPIC_DATA    "esp32/crazypool"
+#define MQTT_TOPIC_STATUS  "esp32/crazypool/status"
 
-// Log levels : 0=off  1=error  2=info (défaut)  3=debug
-// Peut être surchargé depuis platformio.ini : build_flags = -DLOG_LEVEL=3
+// Log levels : 0=off  1=error  2=info  3=debug
+// Surcharge possible : build_flags = -DLOG_LEVEL=3
 #ifndef LOG_LEVEL
-#define LOG_LEVEL 2
+  #define LOG_LEVEL 2
 #endif
+
 #if LOG_LEVEL >= 3
   #define LOG_DEBUG(fmt, ...) Serial.printf("[DEBUG] " fmt "\n", ##__VA_ARGS__)
 #else
@@ -79,163 +103,325 @@ REFACTORING V2 — Stabilité + Robustesse + Maintenance
 #endif
 
 
-// ─── Objets ─────────────────────────────────────────────────────────────────
+// ─── Objets globaux ─────────────────────────────────────────────────────────
 
-DFRobot_ESP_PH ph;
-PZEM004Tv30    pzem(Serial2, 16, 17);  // Serial2, RX2=GPIO16, TX2=GPIO17
-LiquidCrystal  lcd(23, 22, 21, 19, 18, 5);
-OneWire        ds(DS18B20_Pin);
+DFRobot_ESP_PH    ph;
+PZEM004Tv30       pzem(Serial2, 16, 17);
+LiquidCrystal     lcd(23, 22, 21, 19, 18, 5);
+OneWire           ds(DS18B20_PIN);
 DallasTemperature sensors(&ds);
-WiFiClient     espClient;
-PubSubClient   mqttclient(espClient);
+WiFiClient        espClient;
+PubSubClient      mqttclient(espClient);
 
 
 // ─── Variables d'état ───────────────────────────────────────────────────────
 
-float phVoltage, phValue, temperature = 25;
+// Capteurs
+float phVoltage  = 0;
+float phValue    = 7.0;
+float temperature = 25.0;
 
 // Timers non-bloquants
-unsigned long sensorTimer         = 0;
-unsigned long mqttRetryTimer      = 0;
-unsigned long tempRequestTimer    = 0;
-bool          firstRun            = true;
-bool          tempConversionPending = false;
+unsigned long sensorTimer      = 0;
+unsigned long mqttRetryTimer   = 0;
+unsigned long tempRequestTimer = 0;
+bool          firstRun         = true;
+bool          tempPending      = false;
 
-// Edge detection boutons (détection du front montant uniquement)
-bool          lastBtEnter    = false;
-bool          lastBtCal      = false;
-bool          lastBtExit     = false;
-unsigned long debounceEnter  = 0;
-unsigned long debounceCal    = 0;
-unsigned long debounceExit   = 0;
+// Machine à états — bouton unique
+enum CalState : uint8_t { CAL_IDLE, CAL_ACTIVE };
+CalState      calState          = CAL_IDLE;
+bool          btnPrev           = false;   // état bouton au cycle précédent
+unsigned long btnPressStart     = 0;       // millis() au début de l'appui
+bool          longPressFired    = false;   // empêche la répétition du long press
+unsigned long calActivityTimer  = 0;       // timer pour auto-exit 60s
+bool          calPointSaved     = false;   // un point a été sauvegardé dans cette session
+int8_t        lastDotsDisplayed = -1;      // anti-flickering barre de progression
+unsigned long calDisplayTimer   = 0;       // rafraîchissement pH en mode CAL (toutes les 2s)
+
+// LCD — flag pour forcer un rafraîchissement propre après changement d'état
+bool          lcdNeedsFullRefresh = true;
 
 
-// ─── Déclarations forward ───────────────────────────────────────────────────
+// ─── Prototypes ─────────────────────────────────────────────────────────────
 
+void handleButton();
 void readSensorsAndPublish();
 void tryMqttConnect();
-void handleButtons();
+void updateLCD();
 float readTemperature();
-void onWifiConnected(WiFiEvent_t event, WiFiEventInfo_t info);
-void onWifiGotIP(WiFiEvent_t event, WiFiEventInfo_t info);
-void onWifiDisconnected(WiFiEvent_t event, WiFiEventInfo_t info);
+
+void onWifiConnected(arduino_event_id_t event, arduino_event_info_t info);
+void onWifiGotIP(arduino_event_id_t event, arduino_event_info_t info);
+void onWifiDisconnected(arduino_event_id_t event, arduino_event_info_t info);
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 
 
-// ─── setup() ────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+//  SETUP
+// ═══════════════════════════════════════════════════════════════════════════
 
 void setup() {
   Serial.begin(115200);
-  // PAS de while(!Serial) — bloque le démarrage standalone sans PC
+  // Pas de while(!Serial) — bloquerait le démarrage sans PC connecté
 
-  // Watchdog : reboot automatique si la boucle principale se fige
-  esp_task_wdt_init(WDT_TIMEOUT_S, true);  // timeout, panic=true → reboot
-  esp_task_wdt_add(NULL);                  // surveille la tâche courante (loop)
+  // ── Watchdog ──
+  esp_task_wdt_init(WDT_TIMEOUT_S, true);
+  esp_task_wdt_add(NULL);
 
-  // WiFi — event-driven, reconnexion automatique gérée par le stack
+  // ── WiFi (event-driven, non-bloquant) ──
   WiFi.disconnect(true);
   delay(100);
   WiFi.onEvent(onWifiConnected,    ARDUINO_EVENT_WIFI_STA_CONNECTED);
   WiFi.onEvent(onWifiGotIP,        ARDUINO_EVENT_WIFI_STA_GOT_IP);
   WiFi.onEvent(onWifiDisconnected, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
-  WiFi.setAutoReconnect(true);  // reconnexion auto sans intervention du code
+  WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PWD);
-  Serial.println("[WiFi] Connexion en cours...");
+  LOG_INFO("WiFi: connexion en cours...");
 
-  // MQTT — configuration uniquement (pas de connexion bloquante ici)
+  // ── MQTT (config seulement, connexion dans loop) ──
   mqttclient.setServer(MQTT_BROKER, MQTT_BROKER_PORT);
   mqttclient.setCallback(mqttCallback);
   mqttclient.setBufferSize(512);
 
-  // OTA — mise à jour firmware via WiFi, sans câble USB
-  // OTA_PASSWORD doit être défini dans secrets.h — sinon mot de passe par défaut utilisé
+  // ── OTA ──
   #ifndef OTA_PASSWORD
-    #warning "OTA_PASSWORD non défini dans secrets.h ! Définissez-le pour sécuriser les mises à jour."
+    #warning "OTA_PASSWORD non défini dans secrets.h — mot de passe par défaut utilisé"
     #define OTA_PASSWORD "crazypool-ota"
   #endif
   ArduinoOTA.setHostname("CrazyPool");
   ArduinoOTA.setPassword(OTA_PASSWORD);
   ArduinoOTA.onStart([]() {
-    LOG_INFO("OTA: demarrage mise a jour...");
-    esp_task_wdt_reset();  // evite un reboot watchdog pendant le flash
+    LOG_INFO("OTA: demarrage...");
+    esp_task_wdt_reset();
   });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    esp_task_wdt_reset();  // nourrit le watchdog pendant le telechargement
-    LOG_DEBUG("OTA: %u%%", progress / (total / 100));
+    esp_task_wdt_reset();
   });
-  ArduinoOTA.onEnd([]() {
-    LOG_INFO("OTA: termine, redemarrage...");
-  });
-  ArduinoOTA.onError([](ota_error_t error) {
-    LOG_ERROR("OTA: erreur code %u", error);
-  });
+  ArduinoOTA.onEnd([]() { LOG_INFO("OTA: termine, redemarrage..."); });
+  ArduinoOTA.onError([](ota_error_t error) { LOG_ERROR("OTA: erreur %u", error); });
   ArduinoOTA.begin();
-  LOG_INFO("OTA: en attente sur 'CrazyPool.local'");
 
-  EEPROM.begin(32);  // Stockage calibration pH
+  // ── EEPROM (calibration pH) ──
+  EEPROM.begin(32);
 
-  // Ecran LCD — délai nécessaire après soft-reset OTA (le LCD a besoin de temps pour démarrer)
-  delay(300);
+  // ── LCD ──
+  delay(300);  // le HD44780 a besoin de temps après un reset
   lcd.begin(16, 2);
-  lcd.print("CRAZYPOOL");
-  lcd.setCursor(2, 1);
-  lcd.print((char)223);  // symbole °
-  lcd.setCursor(3, 1);
-  lcd.print("C");
-  lcd.setCursor(10, 1);
-  lcd.print("PH:");
+  lcd.clear();
+  lcd.print("CRAZYPOOL  v2");
+  lcd.setCursor(0, 1);
+  lcd.print("Demarrage...");
 
-  ph.begin();       // Sonde pH
-  sensors.begin();  // Sonde température
-  sensors.setWaitForConversion(false);  // conversion non-bloquante (~750ms en tâche de fond)
+  // ── Capteurs ──
+  ph.begin();
+  sensors.begin();
+  sensors.setWaitForConversion(false);  // conversion async (~750ms)
 
-  pinMode(pinBtEnter, INPUT);
-  pinMode(pinBtCal,   INPUT);
-  pinMode(pinBtExit,  INPUT);
+  // ── Bouton ──
+  pinMode(PIN_BUTTON, INPUT);  // pull-down externe : HIGH = pressé
 
-  Serial.println("[Setup] Prêt.");
+  delay(1500);  // laisser le splash screen visible
+  lcdNeedsFullRefresh = true;
+
+  LOG_INFO("Setup termine. GPIO bouton=%d", PIN_BUTTON);
 }
 
 
-// ─── loop() ─────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+//  LOOP
+// ═══════════════════════════════════════════════════════════════════════════
 
 void loop() {
-  esp_task_wdt_reset();  // Nourrit le watchdog — prouve que la boucle tourne
+  esp_task_wdt_reset();
+  ArduinoOTA.handle();
+  mqttclient.loop();
 
-  ArduinoOTA.handle();   // Ecoute les demandes de flash OTA — NON-BLOQUANT
+  // ── Bouton (à chaque cycle, pas toutes les 10s !) ──
+  handleButton();
 
-  mqttclient.loop();     // Keepalive MQTT + réception messages — NON-BLOQUANT
-
-  handleButtons();       // Détection boutons sans aucun blocage
-
-  // Reconnexion MQTT non-bloquante si WiFi ok mais MQTT déconnecté
+  // ── Reconnexion MQTT si nécessaire ──
   if (WiFi.isConnected() && !mqttclient.connected()) {
     tryMqttConnect();
   }
 
   unsigned long now = millis();
 
-  // Phase 1 — lancer la conversion température (retourne immédiatement, pas de blocage)
+  // ── Phase 1 : lancer conversion température (non-bloquant) ──
   if (firstRun || (now - sensorTimer >= SENSOR_INTERVAL)) {
-    sensorTimer           = now;
-    firstRun              = false;
+    sensorTimer = now;
+    firstRun    = false;
     sensors.requestTemperatures();
-    tempRequestTimer      = now;
-    tempConversionPending = true;
+    tempRequestTimer = now;
+    tempPending      = true;
   }
 
-  // Phase 2 — lire température + pH + publier une fois la conversion terminée (~800ms)
-  if (tempConversionPending && (now - tempRequestTimer >= 800)) {
-    tempConversionPending = false;
+  // ── Phase 2 : lire capteurs + publier (~800ms après la demande) ──
+  if (tempPending && (now - tempRequestTimer >= 800)) {
+    tempPending = false;
     readSensorsAndPublish();
+  }
+
+  // ── Affichage pH en temps réel pendant calibration (toutes les 2s) ──
+  if (calState == CAL_ACTIVE && (now - calDisplayTimer >= 2000)) {
+    calDisplayTimer = now;
+    phVoltage = analogRead(PH_PIN) / ESPADC * ESPVOLTAGE;
+    phValue   = ph.readPH(phVoltage, temperature);
+    char line[17];
+    snprintf(line, sizeof(line), "pH: %5.2f       ", phValue);
+    lcd.setCursor(0, 1);
+    lcd.print(line);
   }
 }
 
 
-// ─── readSensorsAndPublish() ─────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+//  BOUTON UNIQUE — Machine à états
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//  État IDLE :
+//    - Appui long 3s  → ENTERPH → passe en CAL_ACTIVE
+//    - Appui court    → ignoré (protection)
+//
+//  État CAL_ACTIVE :
+//    - Appui court    → CALPH  → sauvegarde point de calibration
+//    - Appui long 3s  → EXITPH → quitte + sauvegarde EEPROM
+//    - Timeout 60s    → EXITPH → auto-exit
+//
+//  Feedback LCD pendant l'appui long : barre de progression "......"
+
+void handleButton() {
+  bool btnNow = (digitalRead(PIN_BUTTON) == HIGH);  // pull-down → HIGH = pressé
+  unsigned long now = millis();
+
+  // ── Front montant : début d'appui ──
+  if (btnNow && !btnPrev) {
+    btnPressStart       = now;
+    longPressFired      = false;
+    lastDotsDisplayed   = -1;
+    LOG_DEBUG("Bouton: appui detecte");
+  }
+
+  // ── Maintien : barre de progression + détection long press ──
+  if (btnNow && !longPressFired) {
+    unsigned long held = now - btnPressStart;
+
+    // Afficher la progression après le debounce
+    if (held >= DEBOUNCE_MS) {
+      int8_t dots = (int8_t)min((unsigned long)6, held / 500UL);
+
+      if (dots != lastDotsDisplayed) {
+        lastDotsDisplayed = dots;
+
+        // Construire la ligne de progression (toujours 16 chars)
+        char line[17];
+        char progress[7] = "      ";
+        for (int i = 0; i < dots; i++) progress[i] = '.';
+
+        if (calState == CAL_IDLE) {
+          snprintf(line, sizeof(line), "Calibrer? %-6s", progress);
+        } else {
+          snprintf(line, sizeof(line), "Quitter?  %-6s", progress);
+        }
+        lcd.setCursor(0, 0);
+        lcd.print(line);
+      }
+    }
+
+    // ── Déclenchement long press à 3s ──
+    if (held >= LONGPRESS_MS) {
+      longPressFired = true;
+
+      if (calState == CAL_IDLE) {
+        // → Entrer en mode calibration
+        char cmd[] = "ENTERPH";
+        ph.calibration(phVoltage, temperature, cmd);
+        calState         = CAL_ACTIVE;
+        calActivityTimer = now;
+        calPointSaved    = false;
+        lcdNeedsFullRefresh = true;
+
+        lcd.clear();
+        delay(5);
+        //              0123456789012345
+        lcd.setCursor(0, 0);
+        lcd.print(">> MODE CAL <<  ");
+        lcd.setCursor(0, 1);
+        lcd.print("Court=save      ");
+        LOG_INFO("CAL: mode calibration actif");
+
+      } else {
+        // → Quitter le mode calibration + sauvegarder
+        char cmd[] = "EXITPH";
+        ph.calibration(phVoltage, temperature, cmd);
+        calState = CAL_IDLE;
+        lcdNeedsFullRefresh = true;
+
+        lcd.clear();
+        delay(5);
+        lcd.setCursor(0, 0);
+        lcd.print(calPointSaved ? "Cal sauvee!     " : "Cal annulee     ");
+        lcd.setCursor(0, 1);
+        lcd.print("Retour normal...");
+        LOG_INFO("CAL: quitte (%s)", calPointSaved ? "sauvegarde EEPROM" : "annulee");
+      }
+    }
+  }
+
+  // ── Front descendant : fin d'appui ──
+  if (!btnNow && btnPrev) {
+    unsigned long held = now - btnPressStart;
+
+    if (!longPressFired && held >= DEBOUNCE_MS) {
+      if (calState == CAL_ACTIVE) {
+        // → Appui court en mode CAL = sauvegarder un point
+        char cmd[] = "CALPH";
+        ph.calibration(phVoltage, temperature, cmd);
+        calActivityTimer = now;  // reset du timeout
+        calPointSaved    = true;
+
+        lcd.setCursor(0, 0);
+        lcd.print("Point sauve!    ");
+        lcd.setCursor(0, 1);
+        lcd.print("Long=quitter    ");
+        LOG_INFO("CAL: point sauvegarde (pH=%.2f)", phValue);
+      } else {
+        // Appui court en IDLE → ignoré volontairement
+        LOG_DEBUG("Bouton: appui court en IDLE, ignore");
+      }
+    }
+
+    // Restaurer l'affichage normal si on a relâché sans long press
+    if (!longPressFired && calState == CAL_IDLE) {
+      lcdNeedsFullRefresh = true;
+    }
+    lastDotsDisplayed = -1;
+  }
+
+  // ── Auto-timeout 60s en mode calibration ──
+  if (calState == CAL_ACTIVE && (now - calActivityTimer >= CAL_TIMEOUT_MS)) {
+    char cmd[] = "EXITPH";
+    ph.calibration(phVoltage, temperature, cmd);
+    calState = CAL_IDLE;
+    lcdNeedsFullRefresh = true;
+
+    lcd.setCursor(0, 0);
+    lcd.print(calPointSaved ? "Cal: timeout!   " : "Cal: annulee!   ");
+    lcd.setCursor(0, 1);
+    lcd.print(calPointSaved ? "Sauvegarde auto " : "Rien sauvegarde ");
+    LOG_WARN("CAL: timeout 60s, auto-exit + sauvegarde");
+  }
+
+  btnPrev = btnNow;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  LECTURE CAPTEURS + PUBLICATION MQTT
+// ═══════════════════════════════════════════════════════════════════════════
 
 void readSensorsAndPublish() {
-  // Lecture PZEM (peut renvoyer NaN si non alimenté — géré ci-dessous)
+  // ── Lecture PZEM (peut renvoyer NaN si non alimenté) ──
   float voltage   = pzem.voltage();
   float current   = pzem.current();
   float power     = pzem.power();
@@ -243,28 +429,25 @@ void readSensorsAndPublish() {
   float frequency = pzem.frequency();
   float pf        = pzem.pf();
 
-  // Lecture température + pH
+  // ── Lecture température + pH ──
   temperature = readTemperature();
   phVoltage   = analogRead(PH_PIN) / ESPADC * ESPVOLTAGE;
   phValue     = ph.readPH(phVoltage, temperature);
 
-  // Mise à jour LCD
-  lcd.setCursor(0, 0);
-  lcd.print("CRAZYPOOL       ");
-  lcd.setCursor(0, 1);
-  lcd.print(temperature, 0);
-  lcd.setCursor(13, 1);
-  lcd.print(phValue, 1);
+  LOG_DEBUG("Temp=%.1f pH=%.2f phV=%.0f", temperature, phValue, phVoltage);
 
-  // Publication MQTT uniquement si les deux connexions sont actives
+  // ── Mise à jour LCD — UNIQUEMENT en mode IDLE ──
+  // En mode CAL, c'est handleButton() qui gère l'écran exclusivement
+  if (calState == CAL_IDLE) {
+    updateLCD();
+  }
+
+  // ── Publication MQTT ──
   if (!WiFi.isConnected() || !mqttclient.connected()) {
-    Serial.printf("[Publish] Skipped — WiFi:%d MQTT:%d\n",
-                  WiFi.isConnected(), mqttclient.connected());
+    LOG_DEBUG("Publish skip: WiFi=%d MQTT=%d", WiFi.isConnected(), mqttclient.connected());
     return;
   }
 
-  // Construction JSON avec ArduinoJson — allocation propre, pas de fragmentation
-  // Les valeurs NaN du PZEM sont remplacées par 0 plutôt qu'envoyées telles quelles
   JsonDocument doc;
   doc["temperature"]  = temperature;
   doc["ph"]           = phValue;
@@ -277,116 +460,121 @@ void readSensorsAndPublish() {
 
   char jsonBuffer[256];
   serializeJson(doc, jsonBuffer, sizeof(jsonBuffer));
-
-  Serial.println(jsonBuffer);
+  LOG_INFO("MQTT: %s", jsonBuffer);
   mqttclient.publish(MQTT_TOPIC_DATA, jsonBuffer, true);
 }
 
 
-// ─── tryMqttConnect() ────────────────────────────────────────────────────────
-// Tente une connexion MQTT UNE SEULE FOIS et rend la main immédiatement.
-// Rappelée depuis loop() toutes les MQTT_RETRY_INTERVAL ms si déconnecté.
+// ═══════════════════════════════════════════════════════════════════════════
+//  AFFICHAGE LCD
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//  Mode IDLE — affichage normal :
+//    Ligne 0 : "CRAZYPOOL   MQTT"  (ou WIFI / NWIF / MERR)
+//    Ligne 1 : "25°C      PH:7.2"
+//
+//  Mode CAL — géré exclusivement par handleButton()
+//    Ligne 0 : ">> MODE CAL <<  " / "Point sauve!" / barre progression
+//    Ligne 1 : "Court=save" / "Long=quitter" / pH en temps réel
+
+void updateLCD() {
+  // Rafraîchissement complet si demandé (changement d'état, boot, etc.)
+  if (lcdNeedsFullRefresh) {
+    lcdNeedsFullRefresh = false;
+    lcd.clear();
+    delay(5);
+  }
+
+  // ── Ligne 0 : nom + statut connexion ──
+  char line0[17];
+  const char* status;
+  if (!WiFi.isConnected()) {
+    status = "NWIF";
+  } else if (!mqttclient.connected()) {
+    status = "MERR";
+  } else {
+    status = "MQTT";
+  }
+  snprintf(line0, sizeof(line0), "CRAZYPOOL   %4s", status);
+  lcd.setCursor(0, 0);
+  lcd.print(line0);
+
+  // ── Ligne 1 : température + pH ──
+  // Format : "25°C      PH:7.2"
+  char line1[17];
+  char tempStr[5];
+  dtostrf(temperature, 2, 0, tempStr);  // ex: "25"
+
+  char phStr[5];
+  dtostrf(phValue, 3, 1, phStr);        // ex: "7.2"
+
+  snprintf(line1, sizeof(line1), "%s%cC      PH:%s", tempStr, (char)223, phStr);
+  lcd.setCursor(0, 1);
+  lcd.print(line1);
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  TEMPÉRATURE
+// ═══════════════════════════════════════════════════════════════════════════
+
+float readTemperature() {
+  float t = sensors.getTempCByIndex(0);
+  // Protection contre les lectures invalides (-127 = capteur absent)
+  if (t == DEVICE_DISCONNECTED_C || t < -10 || t > 60) {
+    LOG_WARN("Temp: lecture invalide (%.1f), garde precedente (%.1f)", t, temperature);
+    return temperature;  // garder la dernière valeur connue
+  }
+  return t;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  MQTT
+// ═══════════════════════════════════════════════════════════════════════════
 
 void tryMqttConnect() {
   if (millis() - mqttRetryTimer < MQTT_RETRY_INTERVAL) return;
   mqttRetryTimer = millis();
 
-  // ID unique basé sur l'adresse MAC — évite les conflits si plusieurs ESP32
+  // ID unique basé sur la MAC — évite les conflits multi-ESP32
   char clientId[32];
   snprintf(clientId, sizeof(clientId), "CrazyPool-%08x", (uint32_t)ESP.getEfuseMac());
-  Serial.printf("[MQTT] Connexion id=%s ...\n", clientId);
+  LOG_INFO("MQTT: connexion id=%s", clientId);
 
-  // LWT : si l'ESP32 perd le courant ou plante, le broker publie "offline" tout seul
+  // LWT : le broker publie "offline" si l'ESP32 disparaît
   if (mqttclient.connect(clientId, MQTT_USERNAME, MQTT_KEY,
                          MQTT_TOPIC_STATUS, 1, true, "offline")) {
-    Serial.println("[MQTT] Connecte !");
-    lcd.setCursor(12, 0);
-    lcd.print("MQTT");
-    // Annoncer qu'on est en ligne (retained → Home Assistant le voit même après reconnexion)
+    LOG_INFO("MQTT: connecte !");
     mqttclient.publish(MQTT_TOPIC_STATUS, "online", true);
+    lcdNeedsFullRefresh = true;  // mettre à jour le statut sur le LCD
   } else {
-    Serial.printf("[MQTT] Echec code=%d, retry dans %lus\n",
-                  mqttclient.state(), MQTT_RETRY_INTERVAL / 1000);
-    lcd.setCursor(12, 0);
-    lcd.print("MERR");
+    LOG_ERROR("MQTT: echec code=%d, retry dans %lus", mqttclient.state(), MQTT_RETRY_INTERVAL / 1000);
   }
-  // On retourne immédiatement — AUCUN délai, AUCUNE boucle
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  LOG_INFO("MQTT RX: topic=%s len=%u", topic, length);
+  // Traitement des commandes entrantes à implémenter ici
 }
 
 
-// ─── handleButtons() ─────────────────────────────────────────────────────────
-// Edge detection : réagit uniquement quand le bouton PASSE de relâché à pressé.
-// Aucun while(), aucun delay() — la boucle principale continue de tourner.
-
-void handleButtons() {
-  bool curEnter = digitalRead(pinBtEnter);
-  bool curCal   = digitalRead(pinBtCal);
-  bool curExit  = digitalRead(pinBtExit);
-
-  unsigned long now = millis();
-
-  if (curEnter && !lastBtEnter && (now - debounceEnter >= DEBOUNCE_MS)) {
-    debounceEnter = now;
-    ph.calibration(phVoltage, temperature, (char*)"ENTERPH");
-    lcd.setCursor(9, 1);
-    lcd.print("CAL:");
-  }
-
-  if (curCal && !lastBtCal && (now - debounceCal >= DEBOUNCE_MS)) {
-    debounceCal = now;
-    ph.calibration(phVoltage, temperature, (char*)"CALPH");
-    lcd.setCursor(12, 0);
-    lcd.print("save");
-  }
-
-  if (curExit && !lastBtExit && (now - debounceExit >= DEBOUNCE_MS)) {
-    debounceExit = now;
-    ph.calibration(phVoltage, temperature, (char*)"EXITPH");
-    lcd.setCursor(12, 0);
-    lcd.print("    ");
-    lcd.setCursor(9, 1);
-    lcd.print(" PH:");
-  }
-
-  // Mémoriser l'état pour la prochaine itération
-  lastBtEnter = curEnter;
-  lastBtCal   = curCal;
-  lastBtExit  = curExit;
-}
-
-
-// ─── readTemperature() ───────────────────────────────────────────────────────
-
-float readTemperature() {
-  return sensors.getTempCByIndex(0);  // requestTemperatures() déjà appelé dans loop()
-}
-
-
-// ─── Events WiFi ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+//  ÉVÉNEMENTS WIFI
+// ═══════════════════════════════════════════════════════════════════════════
 
 void onWifiConnected(arduino_event_id_t event, arduino_event_info_t info) {
-  Serial.println("[WiFi] Associé au point d'accès");
+  LOG_INFO("WiFi: associe au point d'acces");
 }
 
 void onWifiGotIP(arduino_event_id_t event, arduino_event_info_t info) {
-  Serial.print("[WiFi] IP : ");
-  Serial.println(WiFi.localIP());
-  lcd.setCursor(12, 0);
-  lcd.print("WIFI");
-  mqttRetryTimer = 0;  // Déclencher une tentative MQTT immédiate
+  LOG_INFO("WiFi: IP = %s", WiFi.localIP().toString().c_str());
+  mqttRetryTimer = 0;  // tenter MQTT immédiatement
+  lcdNeedsFullRefresh = true;
 }
 
 void onWifiDisconnected(arduino_event_id_t event, arduino_event_info_t info) {
-  Serial.printf("[WiFi] Deconnecte, raison : %d\n", info.wifi_sta_disconnected.reason);
-  lcd.setCursor(12, 0);
-  lcd.print("NWIF");
-  // WiFi.setAutoReconnect(true) gere la reconnexion — rien a faire ici
-}
-
-
-// ─── Callback MQTT ───────────────────────────────────────────────────────────
-
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  Serial.printf("[MQTT] Message reçu — topic : %s\n", topic);
-  // Traitement des commandes entrantes à implémenter ici si besoin
+  LOG_WARN("WiFi: deconnecte (raison=%d)", info.wifi_sta_disconnected.reason);
+  lcdNeedsFullRefresh = true;
+  // WiFi.setAutoReconnect(true) gère la reconnexion — rien à faire ici
 }
